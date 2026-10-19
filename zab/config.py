@@ -33,6 +33,3 @@ class Timing:
 
 
 DEFAULT_TIMING = Timing()
-# shorter timings for tests
-FAST_TIMING = Timing(heartbeat_interval=0.05, election_timeout=(0.3, 0.6), finalize_wait=0.1,
-                     ack_timeout=0.3, round_timeout=1.0, tick=0.02)

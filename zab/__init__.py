@@ -1,6 +1,6 @@
 # node, client and logstore are run with "python -m", so they are not imported here
 # (importing them would trigger a runpy warning)
-from .config import CLUSTER, DEFAULT_TIMING, FAST_TIMING, FOLLOWING, LEADING, LOOKING, Timing
+from .config import CLUSTER, DEFAULT_TIMING, FOLLOWING, LEADING, LOOKING, Timing
 from .game import GuessRound, TargetState, closest
 from .messages import (
     Ack,
