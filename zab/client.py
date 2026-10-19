@@ -1,50 +1,30 @@
-"""
-ClientApp: connects to any node, sends Write(x) / Guess(x), reads and live-displays the current target.
-
-    python -m node_message.client --name alice --node n2
-
-Interactive commands: write <x>, guess <x>, read, status, quit.
-Whenever the cluster commits a new target, the connected node pushes a COMMIT and the client
-prints it immediately. If the connected node dies, the client reconnects to another node.
-
-Scripts and tests can use the Client class directly.
-"""
-
-from __future__ import annotations
-
 import argparse
 import queue
 import socket
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
 
-from .config import CLUSTER, Address
-from .framing import iter_messages, send_message
+from .config import CLUSTER
 from .messages import Ack, Commit, Forward, Op
-
-Entry = Dict[str, Any]
+from .network import iter_messages, send_message
 
 
 class Client:
-    def __init__(self, name: str, node_id: Optional[str] = None, cluster: Optional[Dict[str, Address]] = None,
-                 on_event: Optional[Callable[[str], None]] = None) -> None:
+    def __init__(self, name, node_id=None, cluster=None, on_event=None):
         self.name = name
         self.cluster = dict(cluster or CLUSTER)
         self.preferred = node_id or next(iter(self.cluster))
-        self.node_id: Optional[str] = None            # node currently connected to
-        self.target: Optional[Entry] = None           # latest target seen (a log entry)
-        self.history: List[Entry] = []                # every commit notification received
+        self.node_id = None   # node we are connected to
+        self.target = None    # latest target entry seen
+        self.history = []     # every commit pushed to us
         self._on_event = on_event or (lambda text: None)
-        self._sock: Optional[socket.socket] = None
-        self._replies: "queue.Queue[Ack]" = queue.Queue()
+        self._sock = None
+        self._replies = queue.Queue()
         self._request_lock = threading.Lock()
         self._cond = threading.Condition()
         self._closed = threading.Event()
 
-    # ---------- connection ----------
-
-    def connect(self, timeout: float = 5.0) -> "Client":
+    def connect(self, timeout=5.0):
         deadline = time.monotonic() + timeout
         avoid = None
         while True:
@@ -58,12 +38,12 @@ class Client:
                 raise ConnectionError(f"{self.name}: no node reachable")
             time.sleep(0.3)
 
-    def _candidates(self, avoid: Optional[str]) -> List[str]:
+    def _candidates(self, avoid):
         others = [n for n in self.cluster if n not in (self.preferred, avoid)]
         order = ([self.preferred] if self.preferred != avoid else []) + others
         return order + ([avoid] if avoid else [])
 
-    def _connect_to(self, nid: str) -> None:
+    def _connect_to(self, nid):
         sock = socket.create_connection(self.cluster[nid], timeout=1.0)
         sock.settimeout(None)
         self._sock, self.node_id = sock, nid
@@ -72,7 +52,7 @@ class Client:
         if ack.result:
             self._set_target(ack.result, announce=False)
 
-    def close(self) -> None:
+    def close(self):
         self._closed.set()
         if self._sock is not None:
             try:
@@ -81,7 +61,7 @@ class Client:
                 pass
             self._sock.close()
 
-    def _reader(self, sock: socket.socket, nid: str) -> None:
+    def _reader(self, sock, nid):
         try:
             for msg in iter_messages(sock):
                 if isinstance(msg, Commit):
@@ -93,7 +73,8 @@ class Client:
             pass
         if self._closed.is_set() or sock is not self._sock:
             return
-        self._on_event(f"lost connection to {nid}, reconnecting to another node...")
+        # our node died, try the others
+        self._on_event(f"lost connection to {nid}, reconnecting to another node")
         while not self._closed.is_set():
             for other in self._candidates(avoid=nid):
                 try:
@@ -104,7 +85,7 @@ class Client:
                     continue
             time.sleep(0.5)
 
-    def _set_target(self, entry: Entry, announce: bool) -> None:
+    def _set_target(self, entry, announce):
         with self._cond:
             changed = self.target is None or (entry["epoch"], entry["seq"]) != (self.target["epoch"], self.target["seq"])
             self.target = entry
@@ -115,9 +96,7 @@ class Client:
             how = "set by" if entry["op"] == Op.WRITE else "closest guess from"
             self._on_event(f"new target = {entry['value']} ({how} {entry['client']}, epoch={entry['epoch']}, seq={entry['seq']})")
 
-    # ---------- requests ----------
-
-    def _request(self, op: str, value: Any = None, timeout: float = 3.0) -> Ack:
+    def _request(self, op, value=None, timeout=3.0):
         with self._request_lock:
             while not self._replies.empty():
                 self._replies.get_nowait()
@@ -129,21 +108,20 @@ class Client:
             except queue.Empty:
                 raise TimeoutError(f"{self.node_id} did not reply within {timeout}s") from None
 
-    def write(self, value: int) -> Ack:
+    def write(self, value):
         return self._request(Op.WRITE, value)
 
-    def guess(self, value: int) -> Ack:
+    def guess(self, value):
         return self._request(Op.GUESS, value)
 
-    def read(self) -> Optional[int]:
+    def read(self):
         ack = self._request(Op.READ)
         return ack.result["value"] if ack.accepted else None
 
-    def status(self) -> Dict[str, Any]:
+    def status(self):
         return self._request(Op.STATUS).result
 
-    def wait_target(self, value: int, timeout: float = 10.0) -> Entry:
-        """Wait until the target (as pushed by the node) becomes value."""
+    def wait_target(self, value, timeout=10.0):
         deadline = time.monotonic() + timeout
         with self._cond:
             while self.target is None or self.target["value"] != value:
@@ -154,8 +132,8 @@ class Client:
             return self.target
 
 
-def node_status(node_id: str, cluster: Optional[Dict[str, Address]] = None, timeout: float = 1.0) -> Dict[str, Any]:
-    """Query a node's status (without registering as a client)."""
+def node_status(node_id, cluster=None, timeout=1.0):
+    # ask a node for its status without registering as a client
     addr = (cluster or CLUSTER)[node_id]
     with socket.create_connection(addr, timeout=timeout) as sock:
         send_message(sock, Forward(sender_id="admin", op=Op.STATUS, client_id="admin"))
@@ -168,7 +146,7 @@ def node_status(node_id: str, cluster: Optional[Dict[str, Address]] = None, time
 HELP = "commands: write <0-100> | guess <0-100> | read | status | quit"
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(description="Number-guessing client")
     parser.add_argument("--name", required=True, help="client name, e.g. alice")
     parser.add_argument("--node", default="n2", choices=sorted(CLUSTER), help="node to connect to first")
@@ -179,7 +157,7 @@ def main() -> None:
         client.connect()
     except (ConnectionError, TimeoutError) as exc:
         raise SystemExit(f"connection failed: {exc}. Start the nodes first "
-                         f"(python run_local.py -i, or python -m node_message.node n1 ...)")
+                         f"(python3 run_local.py -i, or python3 -m zab.node n1 ...)")
     current = client.target["value"] if client.target else "(none yet)"
     print(f"{args.name} connected to {client.node_id}, current target: {current}\n{HELP}")
     try:

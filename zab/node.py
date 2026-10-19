@@ -1,61 +1,26 @@
-"""
-Node: one ZooKeeper-like node. Wires the components together and implements the follower-side
-and client-side logic.
-
-    NodeServer         (server.py)       accepts incoming connections, dispatches messages
-    Peer               (transport.py)    outbound connections to other nodes (queue + sender thread each)
-    LogStore           (logstore.py)     persistent log (epoch, seq, op, value, status)
-    ElectionManager    (election.py)     heartbeat-timeout detection, elections
-    LeaderCoordinator  (coordinator.py)  assigns (epoch, seq), PROPOSE, collects ACKs, COMMIT, sync, guess rounds
-
-Roles: LOOKING (electing) / FOLLOWING / LEADING.
-
-Follower side:
-    HEARTBEAT  stale epoch -> reply ACK(REJECT) so the old leader steps down; otherwise follow that
-               leader, sending ACK(JOIN) the first time to ask for a log sync
-    PROPOSE    op=SYNC: replace the local log with the leader's, reply ACK(SYNC);
-               normal proposal: log as PROPOSED, reply ACK(epoch, seq). Ignored until synchronised
-    COMMIT     mark (epoch, seq) and all earlier entries COMMITTED, update the target and push it
-               to this node's clients; if the entry is missing (a message was lost) -> ask for a resync
-
-Client side (FORWARD):
-    JOIN online / READ current target / STATUS node status -- answered by this node directly
-    WRITE(x) / GUESS(x) -- followers forward them to the leader (and log nothing until the PROPOSE arrives)
-    Every time a new target is committed, the node pushes the COMMIT to all clients connected to it
-
-Thread safety: all state is read and written under self.lock; while holding it we only enqueue
-messages and write to the local sqlite. Messages to nodes are sent by the Peer threads; messages
-to clients are sent, in order, by one dedicated thread.
-"""
-
-from __future__ import annotations
-
 import argparse
 import logging
 import os
 import queue
 import random
-import socket
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
 
-from .config import CLUSTER, DEFAULT_TIMING, FOLLOWING, LEADING, LOOKING, VALUE_MAX, VALUE_MIN, Address, Timing, quorum
+from .config import CLUSTER, DEFAULT_TIMING, FOLLOWING, LEADING, LOOKING, VALUE_MAX, VALUE_MIN, quorum
 from .coordinator import LeaderCoordinator
 from .election import ElectionManager
-from .framing import send_message
 from .game import TargetState
-from .logstore import COMMITTED, PROPOSED, Entry, LogStore
-from .messages import Ack, AckKind, Commit, Election, Forward, Heartbeat, Message, Op, Propose
-from .server import NodeServer
-from .transport import Peer
+from .logstore import COMMITTED, PROPOSED, LogStore
+from .messages import Ack, AckKind, Commit, Election, Forward, Heartbeat, Op, Propose
+from .network import NodeServer, Peer, send_message
 
-log = logging.getLogger("node_message")
+log = logging.getLogger("zab")
 
 
+# all state is changed under self.lock, and while holding it we only
+# queue messages and write to the local sqlite, never block on the network
 class Node:
-    def __init__(self, node_id: str, cluster: Optional[Dict[str, Address]] = None,
-                 data_dir: str = "data", timing: Timing = DEFAULT_TIMING) -> None:
+    def __init__(self, node_id, cluster=None, data_dir="data", timing=DEFAULT_TIMING):
         self.cluster = dict(cluster or CLUSTER)
         if node_id not in self.cluster:
             raise ValueError(f"unknown node: {node_id}")
@@ -67,29 +32,27 @@ class Node:
         self.lock = threading.RLock()
         self.log = LogStore(os.path.join(data_dir, f"{node_id}.db"))
         self.state = TargetState()
-        self.state.rebuild(self.log.committed_entries())     # after a restart, recover the target from the log
+        self.state.rebuild(self.log.committed_entries())  # recover the target after a restart
 
         self.role = LOOKING
         self.accepted_epoch = self.log.accepted_epoch()
-        self.leader_id: Optional[str] = None
-        self.synced = False                                   # follower: synchronised with the current leader?
+        self.leader_id = None
+        self.synced = False  # follower: synced with the current leader
         self.last_heartbeat = time.monotonic()
         self.election_timeout = self._random_timeout()
         self._join_sent_at = 0.0
 
-        self.clients: Dict[str, socket.socket] = {}           # clients connected to this node
-        self._conn_client: Dict[socket.socket, str] = {}
-        self._client_out: "queue.Queue[Optional[Tuple[socket.socket, Message]]]" = queue.Queue()
+        self.clients = {}  # client name -> socket, clients connected to this node
+        self._conn_client = {}
+        self._client_out = queue.Queue()
 
-        self.peers: Dict[str, Peer] = {}
+        self.peers = {}
         self.election = ElectionManager(self)
         self.leader = LeaderCoordinator(self)
         self.server = NodeServer(node_id, self.cluster[node_id], self._dispatch, self._on_disconnect)
         self._stopped = threading.Event()
 
-    # ===================== lifecycle =====================
-
-    def start(self) -> "Node":
+    def start(self):
         self.peers = {pid: Peer(self.node_id, pid, addr, self.timing.heartbeat_interval)
                       for pid, addr in self.cluster.items() if pid != self.node_id}
         self.server.start()
@@ -102,7 +65,7 @@ class Node:
             self.election.start_looking("node started")
         return self
 
-    def stop(self) -> None:
+    def stop(self):
         with self.lock:
             self._stopped.set()
         self.server.stop()
@@ -112,11 +75,11 @@ class Node:
         with self.lock:
             self.log.close()
 
-    def status(self) -> Dict[str, Any]:
+    def status(self):
         with self.lock:
             return self._status_locked()
 
-    def _status_locked(self) -> Dict[str, Any]:
+    def _status_locked(self):
         epoch, seq = self.log.last_zxid()
         return {
             "node_id": self.node_id, "role": self.role, "epoch": self.accepted_epoch,
@@ -125,21 +88,19 @@ class Node:
             "target": self.state.value, "clients": sorted(self.clients),
         }
 
-    # ===================== sending =====================
-
-    def send(self, peer_id: str, msg: Message) -> None:
+    def send(self, peer_id, msg):
         peer = self.peers.get(peer_id)
         if peer is not None:
             peer.send(msg)
 
-    def broadcast(self, msg: Message) -> None:
+    def broadcast(self, msg):
         for peer in self.peers.values():
             peer.send(msg)
 
-    def _to_client(self, conn: socket.socket, msg: Message) -> None:
+    def _to_client(self, conn, msg):
         self._client_out.put((conn, msg))
 
-    def _client_sender(self) -> None:
+    def _client_sender(self):
         while True:
             item = self._client_out.get()
             if item is None:
@@ -148,24 +109,21 @@ class Node:
             try:
                 send_message(conn, msg)
             except OSError:
-                pass  # client is gone; its reader thread will clean up
+                pass  # client gone, its reader thread cleans up
 
-    # ===================== state helpers (call with the lock held) =====================
-
-    def _random_timeout(self) -> float:
+    def _random_timeout(self):
         return random.uniform(*self.timing.election_timeout)
 
-    def reset_timer(self) -> None:
+    def reset_timer(self):
         self.last_heartbeat = time.monotonic()
         self.election_timeout = self._random_timeout()
 
-    def set_epoch(self, epoch: int) -> None:
+    def set_epoch(self, epoch):
         if epoch != self.accepted_epoch:
             self.accepted_epoch = epoch
-            self.log.set_accepted_epoch(epoch)   # persisted: stale leaders are still recognised after a restart
+            self.log.set_accepted_epoch(epoch)  # persisted to spot stale leaders after a restart
 
-    def apply_committed(self, entries: List[Entry]) -> None:
-        """Apply newly committed entries: update the target and push it to this node's clients."""
+    def apply_committed(self, entries):
         for e in entries:
             self.state.apply(e)
             log.info("[%s] committed (%d,%d) %s %d (%s) -> current target %s",
@@ -174,15 +132,13 @@ class Node:
             if self.role == LEADING:
                 self.leader.on_committed(e)
 
-    def _notify_clients(self, entry: Entry) -> None:
-        msg = Commit(sender_id=self.node_id, epoch=entry["epoch"], seq=entry["seq"],  # type: ignore[arg-type]
-                     op=entry["op"], value=entry["value"], client=entry["client"])  # type: ignore[arg-type]
+    def _notify_clients(self, entry):
+        msg = Commit(sender_id=self.node_id, epoch=entry["epoch"], seq=entry["seq"],
+                     op=entry["op"], value=entry["value"], client=entry["client"])
         for conn in self.clients.values():
             self._to_client(conn, msg)
 
-    # ===================== timer =====================
-
-    def _timer_loop(self) -> None:
+    def _timer_loop(self):
         while not self._stopped.wait(self.timing.tick):
             with self.lock:
                 if self._stopped.is_set():
@@ -195,13 +151,11 @@ class Node:
                     if waited > self.election_timeout:
                         self.election.start_looking(f"no leader heartbeat for {waited:.2f}s")
                     elif self.leader_id and not self.synced and now - self._join_sent_at > self.timing.ack_timeout:
-                        self._send_join()   # sync request or sync data was lost: resend
+                        self._send_join()  # join or sync got lost, resend
                 else:
                     self.election.tick(now)
 
-    # ===================== dispatch =====================
-
-    def _dispatch(self, msg: Message, conn: socket.socket) -> None:
+    def _dispatch(self, msg, conn):
         with self.lock:
             if self._stopped.is_set():
                 return
@@ -221,13 +175,11 @@ class Node:
             elif isinstance(msg, Forward):
                 self._route(msg.op, msg.value, msg.client_id or "?", entry_node=msg.sender_id)
 
-    # ===================== follower side =====================
-
-    def _reject_stale(self, msg: Message) -> None:
+    def _reject_stale(self, msg):
         self.send(msg.sender_id, Ack(sender_id=self.node_id, epoch=self.accepted_epoch, kind=AckKind.REJECT,
                                      accepted=False, reason=f"stale epoch {msg.epoch} < {self.accepted_epoch}"))
 
-    def _on_heartbeat(self, msg: Heartbeat) -> None:
+    def _on_heartbeat(self, msg):
         leader = msg.leader_id or msg.sender_id
         if msg.epoch < self.accepted_epoch:
             self._reject_stale(msg)
@@ -247,34 +199,33 @@ class Node:
             self._send_join()
         self.reset_timer()
 
-    def _send_join(self) -> None:
+    def _send_join(self):
         epoch, seq = self.log.last_zxid()
-        assert self.leader_id is not None
         self.send(self.leader_id, Ack(sender_id=self.node_id, epoch=self.accepted_epoch, seq=seq, kind=AckKind.JOIN))
         self._join_sent_at = time.monotonic()
 
-    def _from_current_leader(self, msg: Message) -> bool:
+    def _from_current_leader(self, msg):
         if msg.epoch < self.accepted_epoch:
             self._reject_stale(msg)
             return False
         return self.role == FOLLOWING and msg.sender_id == self.leader_id and msg.epoch == self.accepted_epoch
 
-    def _on_propose(self, msg: Propose) -> None:
+    def _on_propose(self, msg):
         if not self._from_current_leader(msg):
             return
         if msg.op == Op.SYNC:
             self._apply_sync(msg.value)
-            self.send(self.leader_id, Ack(sender_id=self.node_id, epoch=self.accepted_epoch, kind=AckKind.SYNC))  # type: ignore[arg-type]
+            self.send(self.leader_id, Ack(sender_id=self.node_id, epoch=self.accepted_epoch, kind=AckKind.SYNC))
             return
         if not self.synced:
-            return  # proposals sent before the sync are included in the sync data
-        entry: Entry = {"epoch": msg.epoch, "seq": msg.seq, "op": msg.op, "value": msg.value,
-                        "client": msg.client, "status": PROPOSED}
+            return  # anything before the sync is already in the sync data
+        entry = {"epoch": msg.epoch, "seq": msg.seq, "op": msg.op, "value": msg.value,
+                 "client": msg.client, "status": PROPOSED}
         if self.log.append(entry):
             log.info("[%s] logged PROPOSE (%d,%d) %s %s, sending ACK", self.node_id, msg.epoch, msg.seq, msg.op, msg.value)
         self.send(msg.sender_id, Ack(sender_id=self.node_id, epoch=msg.epoch, seq=msg.seq))
 
-    def _apply_sync(self, entries: List[Entry]) -> None:
+    def _apply_sync(self, entries):
         before = self.state.current
         self.log.replace_all(entries)
         self.state.rebuild(self.log.committed_entries())
@@ -284,14 +235,14 @@ class Node:
         if first_sync:
             log.info("[%s] synchronised with leader %s: %d log entries (%d committed), current target %s",
                      self.node_id, self.leader_id, len(entries), committed, self.state.value)
-            # the new leader does not know this node's clients yet: register them again
+            # new leader doesn't know our clients yet
             for cid in self.clients:
-                self.send(self.leader_id, Forward(sender_id=self.node_id, epoch=self.accepted_epoch,  # type: ignore[arg-type]
+                self.send(self.leader_id, Forward(sender_id=self.node_id, epoch=self.accepted_epoch,
                                                   op=Op.JOIN, client_id=cid))
         if self.state.current is not None and self.state.current != before:
             self._notify_clients(self.state.current)
 
-    def _on_commit(self, msg: Commit) -> None:
+    def _on_commit(self, msg):
         if not self._from_current_leader(msg) or not self.synced:
             return
         entry = self.log.get(msg.epoch, msg.seq)
@@ -303,9 +254,7 @@ class Node:
             return
         self.apply_committed(self.log.commit_upto(msg.epoch, msg.seq))
 
-    # ===================== client side =====================
-
-    def _on_client(self, msg: Message, conn: socket.socket) -> None:
+    def _on_client(self, msg, conn):
         if not isinstance(msg, Forward):
             self._reply(conn, False, f"clients may only send FORWARD, got {msg.type.value}")
             return
@@ -337,12 +286,12 @@ class Node:
         else:
             self._reply(conn, False, f"unknown operation {op!r}")
 
-    def _reply(self, conn: socket.socket, ok: bool, reason: Optional[str] = None, result: Any = None) -> None:
+    def _reply(self, conn, ok, reason=None, result=None):
         self._to_client(conn, Ack(sender_id=self.node_id, epoch=self.accepted_epoch, kind=AckKind.CLIENT,
                                   accepted=ok, reason=reason, result=result))
 
-    def _route(self, op: str, value: Any, client: str, entry_node: str) -> Tuple[bool, str]:
-        """Hand a client request to the leader: handle it directly if we are the leader, otherwise forward it."""
+    def _route(self, op, value, client, entry_node):
+        # leader handles it directly, a follower forwards it and logs nothing yet
         if self.role == LEADING:
             self.leader.on_forward(op, value, client, entry_node)
             return True, f"submitted to leader {self.node_id}"
@@ -354,7 +303,7 @@ class Node:
             return True, f"forwarded by {self.node_id} to leader {self.leader_id}"
         return False, "no leader available right now (election or sync in progress), please retry"
 
-    def _on_disconnect(self, conn: socket.socket) -> None:
+    def _on_disconnect(self, conn):
         with self.lock:
             cid = self._conn_client.pop(conn, None)
             if cid is None or self._stopped.is_set():
@@ -365,7 +314,7 @@ class Node:
                 self._route(Op.LEAVE, None, cid, entry_node=self.node_id)
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(description="Start one node")
     parser.add_argument("node_id", choices=sorted(CLUSTER))
     parser.add_argument("--data-dir", default="data")

@@ -1,23 +1,7 @@
-"""
-Local demo / test script: each node runs as a separate process (localhost:5001-5005),
-clients connect to different nodes.
-
-    python run_local.py               # run the 3 test scenarios of the lab document, print PASS / FAIL
-    python run_local.py --scenario 2  # run a single scenario (whichever one is drawn at the defence)
-    python run_local.py -i            # interactive mode: start 5 nodes, kill / restart nodes, view logs;
-                                      #   run clients in other terminals:
-                                      #   python -m node_message.client --name alice --node n2
-
-Scenarios:
-    1. Normal write: a client sets the target -> leader PROPOSE -> quorum ACKs -> COMMIT -> all clients see it
-    2. Guessing: several clients guess -> leader picks the closest -> committed as the new target -> next round
-    3. Leader crash and recovery: kill -9 the leader -> followers detect the missing heartbeat
-       -> new leader elected -> logs synchronised -> operations resume
-
-Node logs go to logs/<id>.log, persistent logs to data/<id>.db (both cleared before each run).
-"""
-
-from __future__ import annotations
+# starts the 5 nodes as separate processes and runs the 3 lab scenarios
+#   python3 run_local.py                # all 3 scenarios, prints pass / fail
+#   python3 run_local.py --scenario 2   # one scenario
+#   python3 run_local.py -i             # interactive admin mode, run clients in other terminals
 
 import argparse
 import glob
@@ -27,30 +11,29 @@ import socket
 import subprocess
 import sys
 import time
-from typing import Dict, List, Optional
 
-from node_message import CLUSTER, LEADING, Client, LogStore, format_table, node_status
+from zab.client import Client, node_status
+from zab.config import CLUSTER, LEADING
+from zab.logstore import LogStore, format_table
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(ROOT, "data")
 LOG_DIR = os.path.join(ROOT, "logs")
 
 
-def say(text: str = "") -> None:
+def say(text=""):
     print(text, flush=True)
 
 
-def banner(text: str) -> None:
+def banner(text):
     say(f"\n{'=' * 64}\n  {text}\n{'=' * 64}")
 
 
 class Check:
-    """Records the result of each check and sums them up as PASS / FAIL at the end."""
+    def __init__(self):
+        self.failures = []
 
-    def __init__(self) -> None:
-        self.failures: List[str] = []
-
-    def __call__(self, ok: bool, what: str) -> bool:
+    def __call__(self, ok, what):
         say(f"    [{'OK' if ok else 'FAIL'}] {what}")
         if not ok:
             self.failures.append(what)
@@ -58,35 +41,33 @@ class Check:
 
 
 class LocalCluster:
-    def __init__(self) -> None:
-        self.procs: Dict[str, subprocess.Popen] = {}
+    def __init__(self):
+        self.procs = {}
         self._logs = []
 
-    # ---------- processes ----------
-
-    def start(self, nid: str) -> None:
+    def start(self, nid):
         if nid in self.procs and self.procs[nid].poll() is None:
             say(f"  {nid} is already running")
             return
         log = open(os.path.join(LOG_DIR, f"{nid}.log"), "a", encoding="utf-8")
         self._logs.append(log)
         self.procs[nid] = subprocess.Popen(
-            [sys.executable, "-u", "-m", "node_message.node", nid, "--data-dir", DATA_DIR],
+            [sys.executable, "-u", "-m", "zab.node", nid, "--data-dir", DATA_DIR],
             cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
         )
-        _wait_port(CLUSTER[nid])
+        wait_port(CLUSTER[nid])
         say(f"  started {nid} (pid {self.procs[nid].pid}, port {CLUSTER[nid][1]})")
 
-    def kill(self, nid: str) -> None:
+    def kill(self, nid):
         proc = self.procs.get(nid)
         if proc is None or proc.poll() is not None:
             say(f"  {nid} is not running")
             return
-        proc.kill()  # SIGKILL: simulates a process crash
+        proc.kill()  # sigkill, simulates a crash
         proc.wait()
         say(f"  kill -9 {nid} (pid {proc.pid})")
 
-    def stop_all(self) -> None:
+    def stop_all(self):
         for proc in self.procs.values():
             if proc.poll() is None:
                 proc.terminate()
@@ -98,13 +79,11 @@ class LocalCluster:
         for f in self._logs:
             f.close()
 
-    def alive(self) -> List[str]:
+    def alive(self):
         return [nid for nid, p in self.procs.items() if p.poll() is None]
 
-    # ---------- status ----------
-
-    def statuses(self) -> Dict[str, Optional[dict]]:
-        out: Dict[str, Optional[dict]] = {}
+    def statuses(self):
+        out = {}
         for nid in CLUSTER:
             if nid not in self.alive():
                 out[nid] = None
@@ -115,8 +94,8 @@ class LocalCluster:
                 out[nid] = None
         return out
 
-    def wait_stable(self, timeout: float = 15.0) -> str:
-        """Wait until the live nodes have exactly one active leader and all others follow it and are synced."""
+    def wait_stable(self, timeout=15.0):
+        # one ready leader, every live node follows it and is synced
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             live = [s for s in self.statuses().values() if s]
@@ -126,7 +105,7 @@ class LocalCluster:
             time.sleep(0.1)
         raise TimeoutError(f"cluster did not stabilise within {timeout}s: {self.statuses()}")
 
-    def print_status(self) -> None:
+    def print_status(self):
         for nid, s in self.statuses().items():
             if s is None:
                 say(f"  {nid}: stopped")
@@ -135,7 +114,7 @@ class LocalCluster:
                     f"latest(epoch,seq)={tuple(s['last_zxid'])}  target={s['target']}  clients={s['clients']}")
 
 
-def read_log(nid: str) -> list:
+def read_log(nid):
     path = os.path.join(DATA_DIR, f"{nid}.db")
     if not os.path.exists(path):
         return []
@@ -146,14 +125,14 @@ def read_log(nid: str) -> list:
         store.close()
 
 
-def print_logs(node_ids: List[str]) -> None:
+def print_logs(node_ids):
     for nid in node_ids:
-        say(f"  --- {nid}")
+        say(f"  [{nid}]")
         say(format_table(read_log(nid)))
 
 
-def logs_synced(node_ids: List[str], timeout: float = 5.0) -> bool:
-    """Wait until these nodes have identical logs with every entry committed."""
+def logs_synced(node_ids, timeout=5.0):
+    # identical logs on all these nodes, everything committed
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         logs = [read_log(n) for n in node_ids]
@@ -163,7 +142,7 @@ def logs_synced(node_ids: List[str], timeout: float = 5.0) -> bool:
     return False
 
 
-def _wait_port(addr, timeout: float = 5.0) -> None:
+def wait_port(addr, timeout=5.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -174,7 +153,7 @@ def _wait_port(addr, timeout: float = 5.0) -> None:
     raise TimeoutError(f"{addr} did not start listening within {timeout}s")
 
 
-def _check_ports_free() -> None:
+def check_ports_free():
     busy = []
     for nid, addr in CLUSTER.items():
         try:
@@ -184,45 +163,43 @@ def _check_ports_free() -> None:
             pass
     if busy:
         sys.exit(f"ports already in use (nodes from a previous run may still be alive): {', '.join(busy)}\n"
-                 f"stop them with: pkill -f node_message.node")
+                 f"stop them with: pkill -f zab.node")
 
 
-def _reset_dirs() -> None:
+def reset_dirs():
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
     for path in glob.glob(os.path.join(DATA_DIR, "n*.db*")) + glob.glob(os.path.join(LOG_DIR, "n*.log")):
         os.remove(path)
 
 
-# ===================== The three scenarios =====================
-
 class Demo:
-    def __init__(self, cluster: LocalCluster) -> None:
+    def __init__(self, cluster):
         self.cluster = cluster
         self.check = Check()
-        self.clients: Dict[str, Client] = {}
+        self.clients = {}
 
-    def client(self, name: str, node: str) -> Client:
+    def client(self, name, node):
         c = Client(name, node_id=node, on_event=lambda text, n=name: say(f"      [{n} received] {text}")).connect()
         self.clients[name] = c
         say(f"  client {name} connected to {c.node_id}")
         return c
 
-    def close(self) -> None:
+    def close(self):
         for c in self.clients.values():
             c.close()
 
-    def setup(self) -> str:
+    def setup(self):
         leader = self.cluster.wait_stable()
         say(f"\n  cluster ready: leader = {leader}")
         self.cluster.print_status()
-        # spread clients over different nodes (dave is on the leader; in scenario 3 he reconnects automatically)
+        # dave sits on the leader so scenario 3 shows a client reconnect
         for name, node in (("alice", "n2"), ("bob", "n3"), ("carol", "n4"), ("dave", leader)):
             self.client(name, node)
-        time.sleep(0.3)  # let the clients register with the leader
+        time.sleep(0.3)  # let the leader register the clients
         return leader
 
-    def all_see(self, value: int, timeout: float = 8.0) -> bool:
+    def all_see(self, value, timeout=8.0):
         ok = True
         for c in self.clients.values():
             try:
@@ -231,26 +208,22 @@ class Demo:
                 ok = False
         return self.check(ok, f"all clients {sorted(self.clients)} see target = {value}")
 
-    def submit(self, name: str, op: str, value: int) -> None:
+    def submit(self, name, op, value):
         c = self.clients[name]
         ack = (c.write if op == "write" else c.guess)(value)
         say(f"  {name} -> {c.node_id}: {op.upper()}({value})  [{ack.reason}]")
         self.check(ack.accepted, f"{op.upper()}({value}) from {name} accepted")
 
-    # ---------- scenario 1 ----------
-
-    def scenario_write(self) -> None:
+    def scenario_write(self):
         banner("Scenario 1: normal write (Write -> PROPOSE -> ACK -> COMMIT)")
         self.submit("alice", "write", 50)
         self.all_see(50)
         alive = self.cluster.alive()
         self.check(logs_synced(alive), f"logs of all {len(alive)} nodes are identical, entry (epoch, seq) is COMMITTED")
         print_logs(alive[:2])
-        say("  (the other nodes are identical; see logs/n*.log for the full message flow)")
+        say("  (the other nodes are identical, see logs/n*.log for the full message flow)")
 
-    # ---------- scenario 2 ----------
-
-    def scenario_guess(self) -> None:
+    def scenario_guess(self):
         banner("Scenario 2: guessing (clients guess -> leader picks closest -> new target -> next round)")
         if self.clients["alice"].target is None:
             say("  setup: alice sets the target to 50")
@@ -276,9 +249,7 @@ class Demo:
         self.check(logs_synced(alive), "logs of all nodes are identical")
         print_logs(alive[:1])
 
-    # ---------- scenario 3 ----------
-
-    def scenario_crash(self) -> None:
+    def scenario_crash(self):
         banner("Scenario 3: leader crash and recovery")
         if self.clients["alice"].target is None:
             say("  setup: alice sets the target to 50")
@@ -306,7 +277,7 @@ class Demo:
         time.sleep(0.3)
 
         say("\n  operations resume: alice writes 80, then a round with bob 75 / carol 85 / dave 90"
-            " (75 and 85 are equally close -> bob, who guessed first, wins)")
+            " (75 and 85 are equally close, bob guessed first so he wins)")
         self.submit("alice", "write", 80)
         self.all_see(80)
         for name, v in (("bob", 75), ("carol", 85), ("dave", 90)):
@@ -324,18 +295,18 @@ class Demo:
         print_logs([new, old])
 
 
-# ===================== Interactive mode =====================
+HELP = (
+    "commands:\n"
+    "  status          role / epoch / leader / latest (epoch,seq) / target of every node\n"
+    "  logs [id]       print a node's persistent log (all nodes by default)\n"
+    "  kill [id]       kill -9 a node (the current leader by default)\n"
+    "  start <id>      restart a node\n"
+    "  help / q        help / quit (stops all nodes)\n"
+    "run clients in other terminals: python3 -m zab.client --name alice --node n2"
+)
 
-HELP = """commands:
-  status          role / epoch / leader / latest (epoch,seq) / target of every node
-  logs [id]       print a node's persistent log (all nodes by default)
-  kill [id]       kill -9 a node (the current leader by default)
-  start <id>      restart a node
-  help / q        help / quit (stops all nodes)
-run clients in other terminals: python -m node_message.client --name alice --node n2"""
 
-
-def run_interactive(cluster: LocalCluster) -> None:
+def run_interactive(cluster):
     leader = cluster.wait_stable()
     say(f"\ncluster ready, leader = {leader}\n{HELP}")
     while True:
@@ -373,17 +344,17 @@ def run_interactive(cluster: LocalCluster) -> None:
             say(f"  failed: {exc}")
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(description="Start 5 node processes and demonstrate the 3 test scenarios")
     parser.add_argument("-i", "--interactive", action="store_true", help="interactive mode")
     parser.add_argument("--scenario", type=int, choices=(1, 2, 3), help="run a single scenario")
     args = parser.parse_args()
 
-    _check_ports_free()
-    _reset_dirs()
+    check_ports_free()
+    reset_dirs()
     cluster = LocalCluster()
     say("starting 5 node processes (node logs in logs/, persistent logs in data/)")
-    demo: Optional[Demo] = None
+    demo = None
     try:
         for nid in CLUSTER:
             cluster.start(nid)
