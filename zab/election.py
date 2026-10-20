@@ -8,9 +8,9 @@ log = logging.getLogger("zab")
 
 
 # a vote is (candidate, (epoch, seq)): highest (epoch, seq) wins, then lowest node id
-def vote_key(vote):
+def vote_key(vote): # spec 2
     candidate, (epoch, seq) = vote
-    return epoch, seq, -node_num(candidate)
+    return epoch, seq, -node_num(candidate) # spec 2
 
 
 # all methods are called with node.lock held
@@ -26,22 +26,23 @@ class ElectionManager:
     def _self_vote(self):
         return self.node.node_id, self.node.log.last_zxid()
 
-    def start_looking(self, reason):
+    def start_looking(self, reason): #spec 1
         n = self.node
         if n.role == LEADING:
             n.leader.step_down()
         n.role = LOOKING
         n.leader_id = None
         n.synced = False
-        # round > accepted epoch, so the winner's new epoch is always higher
-        self.round = max(self.round, n.accepted_epoch) + 1
+        # round > accepted epoch, so the winner's new epoch is always higher. not max() with
+        # the old round: after a restart or a false timeout it can be stale and skip an epoch
+        self.round = n.accepted_epoch + 1
         self.vote = self._self_vote()
         self.votes = {n.node_id: self.vote}
         self.majority_since = None
         epoch, seq = self.vote[1]
         log.info("[%s] %s -> LOOKING, election round %d, voting for itself (epoch=%d, seq=%d)",
                  n.node_id, reason, self.round, epoch, seq)
-        self._broadcast()
+        self._broadcast() #spec 1
 
     def reset(self):
         self.votes = {}

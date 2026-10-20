@@ -19,7 +19,7 @@ class LeaderCoordinator:
     def _reset(self):
         self.epoch = 0
         self.active = False
-        self.next_seq = 0
+        self.next_seq = 0 # spec 4
         self.pending = OrderedDict()  # seq -> {entry, acks, sent_at}
         self.synced = set()           # followers synced with this leader
         self.sync_sent = {}           # follower -> time of last sync
@@ -28,7 +28,7 @@ class LeaderCoordinator:
         self.round = GuessRound()
         self.next_heartbeat = 0.0
 
-    def become_leader(self, epoch):
+    def become_leader(self, epoch): # spec 3
         n = self.node
         self._reset()
         self.epoch = epoch
@@ -79,7 +79,7 @@ class LeaderCoordinator:
                  n.node_id, len(self.synced) + 1, len(n.cluster), self.epoch)
         queued, self.queued = self.queued, []
         for args in queued:
-            self.on_forward(*args)
+            self.on_forward(*args) # spec 3
 
     def on_ack(self, msg):
         n = self.node
@@ -162,7 +162,7 @@ class LeaderCoordinator:
 
     def propose(self, op, value, client):
         n = self.node
-        self.next_seq += 1
+        self.next_seq += 1 # spec 4
         entry = {"epoch": self.epoch, "seq": self.next_seq, "op": op, "value": value,
                  "client": client, "status": PROPOSED}
         n.log.append(entry)
